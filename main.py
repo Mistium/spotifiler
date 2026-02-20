@@ -1,1422 +1,856 @@
 import os
 import json
 import time
-import webbrowser
 import re
 import subprocess
 import argparse
-import spotipy
-from spotipy.oauth2 import SpotifyOAuth
-import yt_dlp
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 import requests
-from dotenv import load_dotenv
+from datetime import timedelta
 
+from rich.console import Console
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.progress import Progress, BarColumn, TaskProgressColumn, TextColumn
+from rich.table import Table
+from rich.text import Text
+from rich.live import Live
+from rich.align import Align
+import spotipy
+from spotipy.oauth2 import SpotifyOAuth
+import yt_dlp
+from dotenv import load_dotenv
 
 load_dotenv()
 
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-REDIRECT_URI = os.getenv("REDIRECT_URI")
-
-SCOPE = "user-library-read user-read-recently-played"
+# ─── Auth Setup ───────────────────────────────────────────────────────────────
 
 auth_manager = SpotifyOAuth(
-    client_id=CLIENT_ID,
-    client_secret=CLIENT_SECRET,
-    redirect_uri=REDIRECT_URI,
-    scope=SCOPE,
+    client_id=os.getenv("CLIENT_ID"),
+    client_secret=os.getenv("CLIENT_SECRET"),
+    redirect_uri=os.getenv("REDIRECT_URI"),
+    scope="user-library-read user-read-recently-played",
     show_dialog=True,
 )
-
 sp = None
+console = Console(width=min(140, os.get_terminal_size().columns if hasattr(os, "get_terminal_size") else 140))
 
 
-def save_token(token_info):
+# ─── TUI ──────────────────────────────────────────────────────────────────────
 
+class TUIManager:
+    _instance = None
+    _lock = threading.Lock()
+    _initialized = False
+
+    def __new__(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if TUIManager._initialized:
+            return
+        TUIManager._initialized = True
+
+        self.console = console
+        self.spin_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        self.spin_index = 0
+        self.live = None
+        self.state = {
+            "albums": {"total": 0, "completed": 0},
+            "songs": {"total": 0, "completed": 0, "failed": 0, "skipped": 0},
+            "threads": {},
+            "start_time": None,
+            "total_downloaded_bytes": 0,
+            "download_speed": 0,
+            "activity": "idle",
+        }
+
+        self.layout = Layout()
+        self.layout.split_column(
+            Layout(name="header", size=4),
+            Layout(name="body", ratio=1),
+            Layout(name="footer", size=3),
+        )
+        self.layout["body"].split_row(Layout(name="stats", size=40), Layout(name="threads", ratio=1))
+
+    def spinner(self):
+        self.spin_index = (self.spin_index + 1) % len(self.spin_frames)
+        return self.spin_frames[self.spin_index]
+
+    def initialize(self):
+        self.state["start_time"] = time.time()
+        self.live = Live(self.layout, console=self.console, refresh_per_second=30)
+        self.live.start()
+
+    def shutdown(self):
+        if self.live:
+            self.live.stop()
+            self.live = None
+
+    def update_state(self, **kwargs):
+        with self._lock:
+            for key, value in kwargs.items():
+                if isinstance(self.state.get(key), dict) and isinstance(value, dict):
+                    self.state[key].update(value)
+                else:
+                    self.state[key] = value
+            statuses = {t.get("status") for t in self.state["threads"].values()}
+            self.state["activity"] = next(
+                (s for s in ("downloading", "searching", "processing") if s in statuses), "idle"
+            )
+
+    def refresh(self):
+        if not self.live:
+            return
+        s = self.state
+        songs = s["songs"]
+        elapsed = str(timedelta(seconds=int(time.time() - s["start_time"]))) if s["start_time"] else "00:00:00"
+        total, done = songs["total"], songs["completed"]
+        pct = done / total * 100 if total else 0
+        act = s["activity"]
+
+        spin = self.spinner()
+        status_map = {
+            "downloading": Text(f"{spin} Downloading...", style="bold green"),
+            "searching":   Text(f"{spin} Searching...",   style="bold yellow"),
+            "processing":  Text(f"{spin} Processing...",  style="bold cyan"),
+        }
+        status_text = status_map.get(act, Text("● Idle", style="dim"))
+
+        header_text = Text.assemble(
+            ("🎵 ", "bold yellow"), ("Spotify Album Downloader", "bold white"), ("  ", ""), status_text,
+            ("  ", ""), ("Albums: ", "dim"),
+            (f"{s['albums']['completed']}/{s['albums']['total']}", "green" if s['albums']['completed'] == s['albums']['total'] else "cyan"),
+            (" | ", "dim"), ("Songs: ", "dim"),
+            (f"{done}/{total}", "green" if done == total else "cyan"),
+        )
+        self.layout["header"].update(Panel(Align.center(header_text), style="bold blue"))
+
+        footer_text = Text.assemble(
+            ("Elapsed: ", "dim"), (elapsed, "cyan"), (" | ", "dim"),
+            ("Progress: ", "dim"), (f"{pct:.1f}%", "yellow"), (" | ", "dim"),
+            ("Downloaded: ", "dim"), (_fmt_bytes(s["total_downloaded_bytes"]), "cyan"), (" | ", "dim"),
+            ("Speed: ", "dim"), (f"{_fmt_bytes(s['download_speed'])}/s", "cyan"),
+        )
+        self.layout["footer"].update(Panel(Align.center(footer_text)))
+
+        # Stats panel
+        filled = int((done + songs["failed"] + songs["skipped"]) / total * 20) if total else 0
+        bar = "█" * filled + "░" * (20 - filled)
+        active = sum(1 for t in s["threads"].values() if t.get("status") in ("searching", "downloading", "processing"))
+        st = Table.grid(padding=0)
+        st.add_column(style="cyan", width=14)
+        st.add_column(style="white")
+        for row in [
+            ("Albums:", f"{s['albums']['completed']} / {s['albums']['total']}"), ("", ""),
+            ("Songs:", str(total)),
+            ("  Completed:", f"[green]{done}[/green]"),
+            ("  Failed:", f"[red]{songs['failed']}[/red]"),
+            ("  Skipped:", f"[yellow]{songs['skipped']}[/yellow]"), ("", ""),
+            ("Progress:", Text(f"{bar} {pct:.1f}%", style="cyan")), ("", ""),
+            ("Data:", _fmt_bytes(s["total_downloaded_bytes"])),
+            ("Speed:", f"{_fmt_bytes(s['download_speed'])}/s"), ("", ""),
+            ("Active:", f"[yellow]{active}[/yellow] threads"),
+        ]:
+            st.add_row(*row)
+        self.layout["stats"].update(Panel(Align.center(st), title="[bold]Statistics[/bold]", border_style="cyan"))
+
+        # Threads panel
+        tt = Table(show_header=True, header_style="bold magenta", box=None, padding=(0, 1))
+        for col, kw in [("Thread", {"style": "cyan", "width": 10}), ("Status", {"width": 14}),
+                        ("Current File", {"ratio": 1}), ("Progress", {"width": 20}), ("Speed", {"width": 12})]:
+            tt.add_column(col, **kw)
+
+        thread_status_map = {
+            "searching":  lambda sp: Text(f"🔍 {sp}", style="yellow"),
+            "downloading": lambda sp: Text(f"⬇ {sp}", style="green"),
+            "processing":  lambda sp: Text(f"⚙ {sp}", style="blue"),
+            "completed":   lambda _: Text("✓ Done", style="green"),
+            "failed":      lambda _: Text("✗ Failed", style="red"),
+            "skipped":     lambda _: Text("⊘ Skip", style="yellow"),
+        }
+
+        for tid in sorted(s["threads"])[:6]:
+            td = s["threads"][tid]
+            status = td.get("status", "idle")
+            prog = td.get("progress", 0)
+            sp_txt = spin if status in ("searching", "downloading", "processing") else ""
+            st_text = thread_status_map.get(status, lambda _: Text("● Idle", style="dim"))(sp_txt)
+
+            if status == "downloading" and prog > 0:
+                b = "█" * int(prog / 5) + "░" * (20 - int(prog / 5))
+                prog_text = Text(f"{b} {prog:.0f}%", style="green")
+            elif status == "completed":
+                prog_text = Text("████████████████████ 100%", style="green")
+            elif status == "failed":
+                prog_text = Text("-------------------- Failed", style="red")
+            elif status == "skipped":
+                prog_text = Text("░░░░░░░░░░░░░░░░░░░░ Skipped", style="yellow")
+            else:
+                prog_text = Text("-" * 30, style="dim")
+
+            song = td.get("current_song", "")
+            tt.add_row(f"#{tid}", st_text, Text(song[:55] or "-", style="white"), prog_text,
+                       Text(td.get("speed", "") or "-", style="cyan"))
+
+        extra = len(s["threads"]) - 6
+        if extra > 0:
+            tt.add_row("", Text(f"+ {extra} more", style="dim"), "", "", "")
+
+        self.layout["threads"].update(Panel(tt, title=f"[bold]Thread Status [{len(s['threads'])} threads][/bold]", border_style="magenta"))
+        self.live.update(self.layout)
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _fmt_bytes(b):
+    for unit in ("B", "KB", "MB", "GB"):
+        if b < 1024:
+            return f"{b:.2f} {unit}"
+        b /= 1024
+    return f"{b:.2f} TB"
+
+def _parse_speed(s):
+    try:
+        s = s.strip().upper()
+        multipliers = {"GB/S": 1<<30, "GIB/S": 1<<30, "MB/S": 1<<20, "MIB/S": 1<<20, "KB/S": 1<<10, "KIB/S": 1<<10, "B/S": 1}
+        for suffix, mult in multipliers.items():
+            if suffix in s:
+                return float(s.split()[0].replace(",", ".")) * mult
+    except Exception:
+        pass
+    return 0
+
+def _sanitize(name):
+    return re.sub(r'[<>:"/\\|?*]', "", name).strip()[:200]
+
+
+# ─── Spotify ──────────────────────────────────────────────────────────────────
+
+def _save_token(token_info):
     with open(".spotify_token.json", "w") as f:
         json.dump(token_info, f)
-    print("✓ Token saved to .spotify_token.json")
-
 
 def load_spotify_token():
-
     global sp
-
     if not os.path.exists(".spotify_token.json"):
         return False
-
     try:
-        with open(".spotify_token.json", "r") as f:
+        with open(".spotify_token.json") as f:
             token_info = json.load(f)
-
         if auth_manager.is_token_expired(token_info):
-            print("Token expired, refreshing...")
             token_info = auth_manager.refresh_access_token(token_info["refresh_token"])
-            save_token(token_info)
-
+            _save_token(token_info)
         sp = spotipy.Spotify(auth=token_info["access_token"])
-
         user = sp.current_user()
-        if not user:
-            print("Error: Failed to fetch user details")
-            return False
-        print(f"✓ Authenticated as: {user.get('display_name', 'Unknown')}")
+        console.print(f"[green]✓[/green] Authenticated as: [cyan]{user.get('display_name', 'Unknown')}[/cyan]")
         return True
-
     except Exception as e:
-        print(f"Error loading token: {e}")
+        console.print(f"[red]Error loading token: {e}[/red]")
         return False
-
 
 def authenticate_cli():
-
     global sp
-
-    print("Opening browser for Spotify authentication...")
-    print("Please authorize the application in your browser.")
-    print()
-
+    console.print(Panel(Text("Spotify Authentication", style="bold yellow"), style="bold"))
     auth_url = auth_manager.get_authorize_url()
-    print(f"Authorization URL: {auth_url}")
-    print()
+    console.print(f"\n[cyan]Authorization URL:[/cyan]\n  {auth_url}\n")
+    console.print(f"After authorizing, you'll be redirected to: {os.getenv('REDIRECT_URI')}?code=XXXXX...\n")
 
-    try:
-        webbrowser.open(auth_url)
-        print("Browser opened. Please complete authorization.")
-    except:
-        print("Could not open browser automatically.")
-        print("Please manually open the URL above.")
-
-    print()
-    print("After authorizing, you'll be redirected to a URL like:")
-    print(f"  {REDIRECT_URI}?code=XXXXX...")
-    print()
-    auth_code = input(
-        "Paste the FULL redirect URL here (or just the 'code' parameter): "
-    ).strip()
-
-    if "code=" in auth_code:
+    raw = console.input("[yellow]Paste the full redirect URL (or just the 'code'): [/yellow]").strip()
+    if "code=" in raw:
         import urllib.parse
+        raw = urllib.parse.parse_qs(urllib.parse.urlparse(raw).query).get("code", [""])[0]
 
-        parsed = urllib.parse.urlparse(auth_code)
-        params = urllib.parse.parse_qs(parsed.query)
-        auth_code = params.get("code", [""])[0]
-
-    if not auth_code:
-        print("Error: No authorization code provided")
+    if not raw:
+        console.print("[red]No authorization code provided.[/red]")
         return False
 
     try:
-        print("\nExchanging code for token...")
-        token_info = auth_manager.get_access_token(auth_code)
-
-        if not token_info or "access_token" not in token_info:
-            print("Error: Failed to get access token")
-            return False
-
+        token_info = auth_manager.get_access_token(raw)
         sp = spotipy.Spotify(auth=token_info["access_token"])
-
         user = sp.current_user()
-        if not user:
-            print("Error: Failed to fetch user details")
-            return False
-        print(f"✓ Successfully authenticated as: {user.get('display_name', 'Unknown')}")
-
-        save_token(token_info)
-        print("✓ Authentication complete!")
-        print()
-        print("You can now use:")
-        print("  --download      Download all liked albums")
-        print("  --fetch-albums  Fetch and save album list")
-
+        console.print(f"[green]✓ Authenticated as: {user.get('display_name', 'Unknown')}[/green]")
+        _save_token(token_info)
         return True
-
     except Exception as e:
-        print(f"Authentication failed: {e}")
+        console.print(f"[red]Authentication failed: {e}[/red]")
         return False
-
 
 def get_liked_albums():
-    global sp
     if sp is None:
-        raise Exception("Not authenticated. Please log in first.")
-
-    print("Fetching liked albums...")
-    albums = []
-    try:
-        results = sp.current_user_saved_albums(limit=50)
-    except Exception as e:
-        raise Exception(f"Failed to fetch albums from Spotify: {str(e)}")
-
-    if not results:
-        print("No results returned from Spotify")
-        return albums
-
+        raise Exception("Not authenticated.")
+    albums, results = [], sp.current_user_saved_albums(limit=50)
     while results:
-        if not results.get("items"):
-            break
-
-        for item in results["items"]:
-            album = item["album"]
-            albums.append(
-                {
-                    "name": album["name"],
-                    "artists": [a["name"] for a in album["artists"]],
-                    "tracks": [t["name"] for t in album["tracks"]["items"]],
-                    "metadata": {
-                        "id": album["id"],
-                        "uri": album["uri"],
-                        "external_urls": album.get("external_urls", {}),
-                        "release_date": album.get("release_date"),
-                        "release_date_precision": album.get("release_date_precision"),
-                        "total_tracks": album.get("total_tracks"),
-                        "album_type": album.get("album_type"),
-                        "genres": album.get("genres", []),
-                        "label": album.get("label"),
-                        "popularity": album.get("popularity"),
-                        "images": album.get("images", []),
-                        "copyrights": album.get("copyrights", []),
-                        "artists_detailed": [
-                            {
-                                "id": artist["id"],
-                                "name": artist["name"],
-                                "uri": artist["uri"],
-                                "external_urls": artist.get("external_urls", {}),
-                            }
-                            for artist in album["artists"]
-                        ],
-                        "tracks_detailed": [
-                            {
-                                "id": track["id"],
-                                "name": track["name"],
-                                "track_number": track["track_number"],
-                                "disc_number": track["disc_number"],
-                                "explicit": track["explicit"],
-                                "duration_ms": track.get("duration_ms"),
-                                "uri": track["uri"],
-                                "external_urls": track.get("external_urls", {}),
-                                "artists": [
-                                    {
-                                        "id": artist["id"],
-                                        "name": artist["name"],
-                                        "uri": artist["uri"],
-                                    }
-                                    for artist in track["artists"]
-                                ],
-                            }
-                            for track in album["tracks"]["items"]
-                        ],
-                        "added_at": item.get("added_at"),
-                    },
-                }
-            )
-        if results["next"]:
-            results = sp.next(results)
-        else:
-            break
+        for item in results.get("items", []):
+            a = item["album"]
+            albums.append({
+                "name": a["name"],
+                "artists": [x["name"] for x in a["artists"]],
+                "tracks": [t["name"] for t in a["tracks"]["items"]],
+                "metadata": {
+                    "id": a["id"], "uri": a["uri"],
+                    "external_urls": a.get("external_urls", {}),
+                    "release_date": a.get("release_date"),
+                    "total_tracks": a.get("total_tracks"),
+                    "album_type": a.get("album_type"),
+                    "genres": a.get("genres", []),
+                    "label": a.get("label"),
+                    "popularity": a.get("popularity"),
+                    "images": a.get("images", []),
+                    "copyrights": a.get("copyrights", []),
+                    "artists_detailed": [{"id": x["id"], "name": x["name"], "uri": x["uri"], "external_urls": x.get("external_urls", {})} for x in a["artists"]],
+                    "tracks_detailed": [{"id": t["id"], "name": t["name"], "track_number": t["track_number"], "disc_number": t["disc_number"], "explicit": t["explicit"], "duration_ms": t.get("duration_ms"), "uri": t["uri"], "external_urls": t.get("external_urls", {}), "artists": [{"id": x["id"], "name": x["name"], "uri": x["uri"]} for x in t["artists"]]} for t in a["tracks"]["items"]],
+                    "added_at": item.get("added_at"),
+                },
+            })
+        results = sp.next(results) if results["next"] else None
     return albums
 
 
-def get_recently_played():
-    global sp
-    if sp is None:
-        raise Exception("Not authenticated. Please log in first.")
-
-    print("Fetching recently played tracks...")
-    tracks = []
-    try:
-        results = sp.current_user_recently_played(limit=50)
-    except Exception as e:
-        raise Exception(f"Failed to fetch recently played from Spotify: {str(e)}")
-
-    if not results or not results.get("items"):
-        print("No recently played tracks found")
-        return tracks
-
-    for item in results["items"]:
-        track = item["track"]
-        tracks.append(
-            {
-                "name": track["name"],
-                "artists": [a["name"] for a in track["artists"]],
-                "album": track["album"]["name"],
-            }
-        )
-    return tracks
-
+# ─── Download Manager ─────────────────────────────────────────────────────────
 
 class DownloadManager:
-
     _instance = None
-    _progress = {
-        "current_album": "",
-        "current_song": "",
-        "album_progress": 0,
-        "song_progress": 0,
-        "total_albums": 0,
-        "completed_albums": 0,
-        "total_songs": 0,
-        "completed_songs": 0,
-        "failed_downloads": 0,
-        "skipped_songs": 0,
-        "status": "idle",
-        "error": None,
-        "concurrent_downloads": 0,
-        "max_concurrent": int(os.getenv("MAX_CONCURRENT_DOWNLOADS", 4)),
-        "threads": {},
-        "metadata_progress": 0,
-        "metadata_completed": 0,
-        "compression": {
-            "status": "idle",
-            "total_files": 0,
-            "completed_files": 0,
-            "current_file": "",
-            "progress": 0,
-            "space_saved": 0,
-            "original_size": 0,
-            "compressed_size": 0,
-        },
-    }
-
-    def __init__(self):
-        self._download_lock = threading.Lock()
-        self._progress_lock = threading.Lock()
-        self._max_file_size_mb = None
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super(DownloadManager, cls).__new__(cls)
+            cls._instance = super().__new__(cls)
         return cls._instance
 
-    def get_progress(self):
-        return self._progress.copy()
+    def __init__(self):
+        if hasattr(self, "_ready"):
+            return
+        self._ready = True
+        self._lock = threading.Lock()
+        self.tui = TUIManager()
+        self.max_concurrent = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", 4))
+        self._max_file_size_mb = None
+        self._progress = {
+            "total_albums": 0, "completed_albums": 0,
+            "total_songs": 0, "completed_songs": 0,
+            "failed_downloads": 0, "skipped_songs": 0,
+            "concurrent_downloads": 0, "threads": {},
+        }
 
-    def update_progress(self, **kwargs):
-        with self._progress_lock:
-            self._progress.update(kwargs)
-            if "completed_albums" in kwargs or "completed_songs" in kwargs:
-                print(
-                    f"Progress update: Albums {self._progress['completed_albums']}/{self._progress['total_albums']}, "
-                    f"Songs {self._progress['completed_songs']}/{self._progress['total_songs']}"
-                )
+    def _update(self, **kw):
+        with self._lock:
+            self._progress.update(kw)
+            mapping = {
+                "total_albums": ("albums", "total"), "completed_albums": ("albums", "completed"),
+                "total_songs": ("songs", "total"), "completed_songs": ("songs", "completed"),
+                "failed_downloads": ("songs", "failed"), "skipped_songs": ("songs", "skipped"),
+            }
+            updates = {}
+            for k, v in kw.items():
+                if k in mapping:
+                    section, field = mapping[k]
+                    updates.setdefault(section, {})[field] = v
+            for section, vals in updates.items():
+                self.tui.update_state(**{section: vals})
+            if updates:
+                self.tui.refresh()
 
-    def _progress_hook(self, d, thread_id):
+    def _update_thread(self, tid, **kw):
+        with self._lock:
+            self._progress["threads"].setdefault(tid, {"current_song": "", "status": "idle", "progress": 0, "speed": ""})
+            self._progress["threads"][tid].update(kw)
+            self.tui.update_state(threads={t: d.copy() for t, d in self._progress["threads"].items()})
+            self.tui.refresh()
+
+    def _progress_hook(self, d, tid):
         if d["status"] == "downloading":
             try:
-                downloaded_bytes = d.get("downloaded_bytes", 0)
-                total_bytes = d.get("total_bytes", 0) or d.get(
-                    "total_bytes_estimate", 0
-                )
-
-                if total_bytes > 0:
-                    progress_val = (downloaded_bytes / total_bytes) * 100
-                else:
-                    percent_str = d.get("_percent_str", "0%").replace("%", "").strip()
-                    try:
-                        progress_val = float(percent_str)
-                    except:
-                        progress_val = 0
-                speed = d.get("_speed_str", "Unknown")
-                eta = d.get("_eta_str", "Unknown")
-                self.update_thread_progress(
-                    thread_id,
-                    progress=progress_val,
-                    status="downloading",
-                    speed=speed,
-                    eta=eta,
-                )
-                if thread_id == 0:
-                    print(
-                        f"Thread {thread_id}: Download progress: {progress_val:.1f}% (Speed: {speed}, ETA: {eta})"
-                    )
-                if thread_id == 0:
-                    self.update_progress(song_progress=progress_val)
-
-            except Exception as e:
-                print(f"Progress hook error for thread {thread_id}: {e}")
+                dl, total = d.get("downloaded_bytes", 0), d.get("total_bytes") or d.get("total_bytes_estimate", 0)
+                pct = (dl / total * 100) if total else float(d.get("_percent_str", "0%").replace("%", "") or 0)
+                speed_bytes = _parse_speed(d.get("_speed_str", ""))
+                self._update_thread(tid, progress=pct, status="downloading", speed=d.get("_speed_str", ""), eta=d.get("_eta_str", ""))
+                with self._lock:
+                    last = self._progress["threads"].get(tid, {}).get("last_downloaded", 0)
+                    chunk = dl - last
+                    if chunk > 0:
+                        self.tui.update_state(total_downloaded_bytes=self.tui.state.get("total_downloaded_bytes", 0) + chunk)
+                    self._progress["threads"][tid]["last_downloaded"] = dl
+                self.tui.update_state(download_speed=speed_bytes)
+                self.tui.refresh()
+            except Exception:
                 pass
         elif d["status"] == "finished":
-            print(f"Thread {thread_id}: Download finished")
-            self.update_thread_progress(thread_id, progress=100, status="processing")
-            if thread_id == 0:
-                self.update_progress(song_progress=100)
+            self._update_thread(tid, progress=100, status="processing")
         elif d["status"] == "error":
-            print(f"Thread {thread_id}: Download error in progress hook")
-            self.update_thread_progress(
-                thread_id, status="failed", error="Download failed"
-            )
+            self._update_thread(tid, status="failed")
 
-    def update_thread_progress(self, thread_id, **kwargs):
-        with self._progress_lock:
-            if thread_id not in self._progress["threads"]:
-                self._progress["threads"][thread_id] = {
-                    "current_song": "",
-                    "status": "idle",
-                    "progress": 0,
-                    "error": None,
-                    "speed": "",
-                    "eta": "",
-                }
-            self._progress["threads"][thread_id].update(kwargs)
+    def search_youtube(self, song, artist, album=None, duration_ms=None):
+        queries = [
+            f"{song} {artist} {album} official audio" if album else f"{song} {artist} official audio",
+            f"{song} {artist} {album}" if album else f"{song} {artist}",
+            f"{song} {artist}",
+        ]
+        ydl_opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "default_search": "ytsearch5:", "socket_timeout": 30}
 
-    def sanitize_filename(self, filename):
-        filename = re.sub(r'[<>:"/\\|?*]', "", filename)
-        filename = filename.strip()
-        return filename[:200]
-
-    def search_youtube(self, song_name, artist_name, album_name=None, duration_ms=None):
-
-        try:
-
-            if album_name:
-                query = f"{song_name} {artist_name} {album_name} official audio"
-            else:
-                query = f"{song_name} {artist_name} official audio"
-
-            ydl_opts = {
-                "quiet": True,
-                "no_warnings": True,
-                "extract_flat": False,
-                "default_search": "ytsearch5:",
-            }
-
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                search_results = ydl.extract_info(f"ytsearch5:{query}", download=False)
-
-                if (
-                    not search_results
-                    or "entries" not in search_results
-                    or not search_results["entries"]
-                ):
-                    return None
+        for i, query in enumerate(queries):
+            try:
+                if i:
+                    time.sleep(1)
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    results = ydl.extract_info(f"ytsearch5:{query}", download=False)
+                entries = (results or {}).get("entries") or []
+                if not entries:
+                    continue
 
                 if duration_ms:
-                    target_duration = duration_ms / 1000
-                    best_match = None
-                    best_score = float("inf")
+                    target = duration_ms / 1000
+                    def score(e):
+                        t = e.get("title", "").lower()
+                        bonus = -5 if any(w in t for w in ("official", "audio")) else \
+                                -3 if any(w in t for w in ("lyrics", "lyric")) else \
+                                10 if any(w in t for w in ("cover", "remix", "live")) else 0
+                        return abs(e.get("duration", 0) - target) + bonus
+                    entry = min(entries, key=score)
+                else:
+                    entry = entries[0]
 
-                    for entry in search_results["entries"]:
-                        if not entry:
-                            continue
+                return f"https://www.youtube.com/watch?v={entry['id']}"
+            except Exception:
+                continue
+        return None
 
-                        video_duration = entry.get("duration", 0)
-                        title_lower = entry.get("title", "").lower()
-
-                        duration_diff = abs(video_duration - target_duration)
-
-                        title_bonus = 0
-                        if "official" in title_lower or "audio" in title_lower:
-                            title_bonus = -5
-                        if "lyrics" in title_lower or "lyric video" in title_lower:
-                            title_bonus = -3
-                        if (
-                            "cover" in title_lower
-                            or "remix" in title_lower
-                            or "live" in title_lower
-                        ):
-                            title_bonus = 10
-
-                        score = duration_diff + title_bonus
-
-                        if score < best_score:
-                            best_score = score
-                            best_match = entry
-
-                    if best_match:
-                        video_id = best_match["id"]
-                        print(
-                            f"  → Matched with duration {best_match.get('duration', 0)}s (target: {target_duration:.0f}s)"
-                        )
-                        return f"https://www.youtube.com/watch?v={video_id}"
-
-                video_id = search_results["entries"][0]["id"]
-                return f"https://www.youtube.com/watch?v={video_id}"
-
-        except Exception as e:
-            print(f"YouTube search error: {e}")
-            return None
-
-    def check_song_exists(self, song_name, album_path):
-
+    def _song_exists(self, song_name, album_path):
         try:
-            base_filename = song_name
-            existing_files = [
-                f
-                for f in os.listdir(album_path)
-                if f.startswith(base_filename)
-                and not f.startswith(".")
-                and "_thread" not in f
-            ]
-            return len(existing_files) > 0
+            return any(f.startswith(song_name) and not f.startswith(".") and "_thread" not in f for f in os.listdir(album_path))
         except OSError:
             return False
 
-    def download_song(self, song_info, album_path, thread_id=0):
-        song_name = self.sanitize_filename(song_info["name"])
-        artist_name = self.sanitize_filename(" & ".join(song_info["artists"]))
+    def _download_with_retry(self, url, opts_base, album_path, temp_name, tid, retries=4):
+        formats = ["bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio/best", "bestaudio/best", "worstaudio/worst"]
+        for attempt in range(retries):
+            for fmt in formats:
+                try:
+                    if attempt:
+                        time.sleep(2 ** attempt)
+                    opts = {**opts_base, "format": fmt}
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        ydl.download([url])
+                    found = [f for f in os.listdir(album_path) if f.startswith(temp_name)]
+                    if found:
+                        return True, found[0]
+                except Exception as e:
+                    err = str(e).lower()
+                    if "403" in err or "forbidden" in err:
+                        time.sleep(3 + attempt * 2)
+                    elif "format" not in err and "not available" not in err:
+                        break
+        return False, "Download failed"
+
+    def download_song(self, song_info, album_path, tid=0):
+        name = _sanitize(song_info["name"])
+        artist = _sanitize(" & ".join(song_info["artists"]))
         album_name = song_info.get("album_name", "")
         duration_ms = song_info.get("duration_ms")
 
-        start_time = time.time()
-        self.update_thread_progress(
-            thread_id,
-            current_song=f"{song_name} by {artist_name}",
-            status="checking",
-            progress=0,
-            error=None,
-        )
+        self._update_thread(tid, current_song=f"{name} by {artist}", status="checking", progress=0)
 
-        if self.check_song_exists(song_name, album_path):
-            print(f"Thread {thread_id}: Skipping {song_name} - already exists")
-            self.update_thread_progress(thread_id, status="skipped", progress=100)
-            self.update_progress(
-                completed_songs=self._progress["completed_songs"] + 1,
-                skipped_songs=self._progress["skipped_songs"] + 1,
-            )
+        if self._song_exists(name, album_path):
+            self._update_thread(tid, status="skipped", progress=100)
+            self._update(completed_songs=self._progress["completed_songs"] + 1, skipped_songs=self._progress["skipped_songs"] + 1)
             return True
 
-        self.update_progress(
-            current_song=f"[Thread {thread_id}] {song_name} by {artist_name}",
-            concurrent_downloads=self._progress["concurrent_downloads"] + 1,
-        )
+        self._update_thread(tid, status="searching")
+        url = self.search_youtube(name, artist, album_name, duration_ms)
+        if not url:
+            self._update_thread(tid, status="failed")
+            self._update(failed_downloads=self._progress["failed_downloads"] + 1)
+            return False
 
-        try:
-            self.update_thread_progress(thread_id, status="searching")
-            print(f"Thread {thread_id}: Starting search for {song_name}")
+        self._update_thread(tid, status="downloading")
+        temp = f"{name}_thread{tid}_{int(time.time())}"
+        opts = {
+            "outtmpl": os.path.join(album_path, f"{temp}.%(ext)s"),
+            "quiet": True, "no_warnings": True,
+            "progress_hooks": [lambda d: self._progress_hook(d, tid)],
+            "socket_timeout": 60, "retries": 5, "fragment_retries": 5,
+            "skip_unavailable_fragments": True, "concurrent_fragment_downloads": 3,
+            "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        }
 
-            search_start = time.time()
-            youtube_url = self.search_youtube(
-                song_name, artist_name, album_name, duration_ms
-            )
-            search_time = time.time() - search_start
-            print(f"Thread {thread_id}: Search took {search_time:.2f}s")
+        success, result = self._download_with_retry(url, opts, album_path, temp, tid)
+        if not success:
+            self._update_thread(tid, status="failed")
+            self._update(failed_downloads=self._progress["failed_downloads"] + 1)
+            return False
 
-            if not youtube_url:
-                print(f"Thread {thread_id}: No YouTube link found for {song_name}")
-                self.update_thread_progress(
-                    thread_id, status="failed", error="No YouTube link found"
-                )
-                self.update_progress(
-                    failed_downloads=self._progress["failed_downloads"] + 1,
-                    concurrent_downloads=self._progress["concurrent_downloads"] - 1,
-                )
-                return False
+        temp_path = os.path.join(album_path, result)
+        ext = os.path.splitext(result)[1].lower()
+        final_path = os.path.join(album_path, f"{name}.mp3")
 
-            self.update_thread_progress(thread_id, status="downloading")
-            print(
-                f"Thread {thread_id}: Starting download for {song_name} from {youtube_url}"
-            )
-            temp_filename = f"{song_name}_thread{thread_id}_{int(time.time())}"
-            ydl_opts = {
-                "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-                "outtmpl": os.path.join(album_path, f"{temp_filename}.%(ext)s"),
-                "quiet": True,
-                "no_warnings": True,
-                "progress_hooks": [lambda d: self._progress_hook(d, thread_id)],
-                "extractaudio": True,
-                "audioformat": "mp3",
-                "audioquality": "0",
-                "prefer_ffmpeg": True,
-                "socket_timeout": 30,
-                "retries": 3,
-                "fragment_retries": 3,
-                "skip_unavailable_fragments": True,
-                "concurrent_fragment_downloads": 2,
-                "postprocessor_args": [
-                    "-ar",
-                    "44100",
-                ],
-            }
-
-            download_start = time.time()
-
+        if ext != ".mp3":
             try:
-                ydl_opts["postprocessors"] = [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "320",
-                    }
-                ]
+                subprocess.run(["ffmpeg", "-y", "-i", temp_path, "-codec:a", "libmp3lame", "-b:a", "320k", "-map", "a", "-loglevel", "error", final_path], capture_output=True, timeout=120)
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+            except Exception:
+                os.rename(temp_path, os.path.join(album_path, f"{name}{ext}"))
+        else:
+            os.rename(temp_path, final_path)
 
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([youtube_url])
+        self._update_thread(tid, status="completed", progress=100)
+        self._update(completed_songs=self._progress["completed_songs"] + 1)
+        return True
 
-                download_time = time.time() - download_start
-                print(f"Thread {thread_id}: Download completed in {download_time:.2f}s")
-                temp_files = [
-                    f for f in os.listdir(album_path) if f.startswith(temp_filename)
-                ]
-                if temp_files:
-                    temp_path = os.path.join(album_path, temp_files[0])
-                    final_path = os.path.join(album_path, f"{song_name}.mp3")
-                    os.rename(temp_path, final_path)
-                    print(f"Thread {thread_id}: File renamed to {song_name}.mp3")
-
-            except Exception as ffmpeg_error:
-                if (
-                    "ffmpeg" in str(ffmpeg_error).lower()
-                    or "postprocessor" in str(ffmpeg_error).lower()
-                ):
-                    print(
-                        f"Thread {thread_id}: FFmpeg issue, downloading original format for {song_name}"
-                    )
-                    ydl_opts_fallback = {
-                        "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
-                        "outtmpl": os.path.join(album_path, f"{temp_filename}.%(ext)s"),
-                        "quiet": True,
-                        "no_warnings": True,
-                        "progress_hooks": [lambda d: self._progress_hook(d, thread_id)],
-                        "socket_timeout": 30,
-                        "retries": 3,
-                        "fragment_retries": 3,
-                        "skip_unavailable_fragments": True,
-                    }
-
-                    with yt_dlp.YoutubeDL(ydl_opts_fallback) as ydl:
-                        ydl.download([youtube_url])
-
-                    download_time = time.time() - download_start
-                    print(
-                        f"Thread {thread_id}: Fallback download completed in {download_time:.2f}s"
-                    )
-                    temp_files = [
-                        f for f in os.listdir(album_path) if f.startswith(temp_filename)
-                    ]
-                    if temp_files:
-                        temp_path = os.path.join(album_path, temp_files[0])
-                        extension = os.path.splitext(temp_files[0])[1]
-                        final_path = os.path.join(album_path, f"{song_name}{extension}")
-                        os.rename(temp_path, final_path)
-                        print(
-                            f"Thread {thread_id}: File renamed to {song_name}{extension}"
-                        )
-                else:
-                    raise ffmpeg_error
-
-            total_time = time.time() - start_time
-            print(f"Thread {thread_id}: Total time for {song_name}: {total_time:.2f}s")
-
-            self.update_thread_progress(thread_id, status="completed", progress=100)
-
-            self.update_progress(
-                completed_songs=self._progress["completed_songs"] + 1,
-                concurrent_downloads=self._progress["concurrent_downloads"] - 1,
-            )
-            return True
-
-        except Exception as e:
-            error_time = time.time() - start_time
-            print(
-                f"Thread {thread_id}: Download error for {song_name} after {error_time:.2f}s: {e}"
-            )
-            self.update_thread_progress(thread_id, status="failed", error=str(e))
-            self.update_progress(
-                failed_downloads=self._progress["failed_downloads"] + 1,
-                concurrent_downloads=self._progress["concurrent_downloads"] - 1,
-            )
-            return False
-
-    def download_image(self, url, file_path):
-
+    def _download_image(self, url, path):
         try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-
-            with open(file_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
+            r = requests.get(url, stream=True, timeout=30)
+            r.raise_for_status()
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(8192):
                     f.write(chunk)
-
-            print(f"Downloaded image: {file_path}")
             return True
-
-        except Exception as e:
-            print(f"Error downloading image {url}: {e}")
+        except Exception:
             return False
 
-    def download_album_artwork(self, album_info, album_path):
-
-        global sp
-        if sp is None:
-            print("Warning: Not authenticated, skipping artist artwork download")
-            return False
-
+    def _save_album_metadata(self, album, album_path):
         try:
-            metadata = album_info.get("metadata", {})
-            images = metadata.get("images", [])
-            if images:
-                album_image_url = images[0].get("url")
-                if album_image_url:
-                    album_cover_path = os.path.join(album_path, "album.png")
-                    self.download_image(album_image_url, album_cover_path)
-            artists_detailed = metadata.get("artists_detailed", [])
-            if artists_detailed:
-                primary_artist = artists_detailed[0]
-                artist_id = primary_artist.get("id")
-
-                if artist_id:
-                    try:
-                        artist_details = sp.artist(artist_id)
-                        if not artist_details:
-                            print(f"Error fetching artist details")
-                            return False
-                        artist_images = artist_details.get("images", [])
-
-                        if artist_images:
-                            artist_image_url = artist_images[0].get("url")
-                            if artist_image_url:
-                                artist_image_path = os.path.join(
-                                    album_path, "artist.png"
-                                )
-                                self.download_image(artist_image_url, artist_image_path)
-
-                    except Exception as e:
-                        print(f"Error fetching artist details: {e}")
-
-            return True
-
-        except Exception as e:
-            print(f"Error downloading artwork: {e}")
-            return False
-
-    def save_album_metadata(self, album_info, album_path):
-
-        try:
-            album_json_path = os.path.join(album_path, "album.json")
-            album_metadata = {
-                "basic_info": {
-                    "name": album_info["name"],
-                    "artists": album_info["artists"],
-                    "total_tracks": len(album_info["tracks"]),
-                },
-                "spotify_metadata": album_info.get("metadata", {}),
+            data = {
+                "basic_info": {"name": album["name"], "artists": album["artists"], "total_tracks": len(album["tracks"])},
+                "spotify_metadata": album.get("metadata", {}),
                 "download_info": {
-                    "downloaded_at": time.strftime(
-                        "%Y-%m-%d %H:%M:%S UTC", time.gmtime()
-                    ),
-                    "last_updated": time.strftime(
-                        "%Y-%m-%d %H:%M:%S UTC", time.gmtime()
-                    ),
+                    "downloaded_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
                     "downloader_version": "1.1",
-                    "tracks_list": album_info["tracks"],
-                    "artwork_downloaded": {
-                        "album_cover": "album.png",
-                        "artist_image": "artist.png",
-                    },
+                    "tracks_list": album["tracks"],
+                    "artwork_downloaded": {"album_cover": "album.png", "artist_image": "artist.png"},
                 },
             }
-
-            with open(album_json_path, "w", encoding="utf-8") as f:
-                json.dump(album_metadata, f, indent=2, ensure_ascii=False)
-
-            print(f"Saved album metadata to {album_json_path}")
+            with open(os.path.join(album_path, "album.json"), "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
             return True
-
-        except Exception as e:
-            print(f"Error saving album metadata: {e}")
+        except Exception:
             return False
 
-    def process_album_metadata(self, album_info, album_path):
+    def _download_artwork(self, album, album_path):
+        meta = album.get("metadata", {})
+        if imgs := meta.get("images"):
+            self._download_image(imgs[0]["url"], os.path.join(album_path, "album.png"))
+        if (artists := meta.get("artists_detailed")) and sp:
+            try:
+                artist_imgs = sp.artist(artists[0]["id"]).get("images", [])
+                if artist_imgs:
+                    self._download_image(artist_imgs[0]["url"], os.path.join(album_path, "artist.png"))
+            except Exception:
+                pass
 
+    def fetch_and_save_artist_data(self, artist_id, artist_name):
+        if not sp:
+            return False
         try:
-            print(f"Processing metadata for: {album_info['name']}")
+            path = os.path.join(os.getcwd(), "artists", _sanitize(artist_name))
+            os.makedirs(path, exist_ok=True)
+            details = sp.artist(artist_id)
+            if imgs := details.get("images"):
+                largest = max(imgs, key=lambda x: x.get("width", 0) * x.get("height", 0))
+                self._download_image(largest["url"], os.path.join(path, "icon.png"))
 
-            self.save_album_metadata(album_info, album_path)
+            albums = []
+            results = sp.artist_albums(artist_id, album_type="album", limit=50)
+            while results:
+                for a in results["items"]:
+                    albums.append({"name": a["name"], "id": a["id"], "release_date": a.get("release_date"), "total_tracks": a.get("total_tracks"), "cover_art": (a.get("images") or [{}])[0].get("url")})
+                results = sp.next(results) if results["next"] else None
 
-            self.download_album_artwork(album_info, album_path)
-
+            with open(os.path.join(path, "info.json"), "w", encoding="utf-8") as f:
+                json.dump({"name": details.get("name"), "id": details.get("id"), "genres": details.get("genres", []), "followers": details.get("followers", {}).get("total", 0), "popularity": details.get("popularity", 0), "external_urls": details.get("external_urls", {}), "albums": albums, "images": [{"url": i["url"], "width": i["width"], "height": i["height"]} for i in details.get("images", [])], "downloaded_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())}, f, indent=2, ensure_ascii=False)
             return True
-        except Exception as e:
-            print(f"Error processing album metadata: {e}")
+        except Exception:
             return False
 
-    def download_all_metadata_parallel(self, albums, base_path):
+    def _album_folder(self, album, base_path):
+        name = _sanitize(album["name"])
+        artist = _sanitize(" & ".join(album["artists"]))
+        return os.path.join(base_path, f"{artist} - {name}")
 
-        print(f"Starting parallel metadata download for {len(albums)} albums...")
+    def _build_song_queue(self, albums, base_path):
+        q = queue.Queue()
+        skipped = 0
+        for i, album in enumerate(albums):
+            album_path = self._album_folder(album, base_path)
+            track_details = album.get("metadata", {}).get("tracks_detailed", [])
+            for j, track in enumerate(album["tracks"]):
+                name = _sanitize(track)
+                if self._song_exists(name, album_path):
+                    skipped += 1
+                    continue
+                q.put({"name": track, "artists": album["artists"], "album_name": _sanitize(album["name"]), "artist_name": _sanitize(" & ".join(album["artists"])), "album_path": album_path, "album_idx": i, "duration_ms": track_details[j].get("duration_ms") if j < len(track_details) else None})
+        if skipped:
+            console.print(f"[yellow]Skipping {skipped} already-downloaded song{'s' if skipped != 1 else ''}[/yellow]")
+            self._update(skipped_songs=skipped, completed_songs=skipped)
+        return q
 
-        self.update_progress(
-            status="downloading_metadata", metadata_progress=0, metadata_completed=0
-        )
+    def _run_workers(self, dq, albums, on_result):
+        completed_set = set()
 
-        metadata_tasks = []
-
-        for album in albums:
-            album_name = self.sanitize_filename(album["name"])
-            artist_name = self.sanitize_filename(" & ".join(album["artists"]))
-            album_folder = f"{artist_name} - {album_name}"
-            album_path = os.path.join(base_path, album_folder)
-
-            os.makedirs(album_path, exist_ok=True)
-
-            metadata_tasks.append((album, album_path))
-
-        max_metadata_workers = min(10, len(albums))
-        completed_count = 0
-
-        with ThreadPoolExecutor(max_workers=max_metadata_workers) as executor:
-            future_to_album = {
-                executor.submit(self.process_album_metadata, album, path): album["name"]
-                for album, path in metadata_tasks
-            }
-
-            for future in as_completed(future_to_album):
-                album_name = future_to_album[future]
-                try:
-                    result = future.result()
-                    completed_count += 1
-                    progress = (completed_count / len(albums)) * 100
-
-                    self.update_progress(
-                        metadata_completed=completed_count, metadata_progress=progress
-                    )
-
-                    print(
-                        f"Metadata completed for: {album_name} ({completed_count}/{len(albums)})"
-                    )
-
-                except Exception as e:
-                    print(f"Error processing metadata for {album_name}: {e}")
-
-        print(f"Completed metadata download for all {len(albums)} albums")
-
-    def download_albums(self, albums):
-        self.update_progress(
-            status="initializing",
-            total_albums=len(albums),
-            completed_albums=0,
-            total_songs=sum(len(album["tracks"]) for album in albums),
-            completed_songs=0,
-            failed_downloads=0,
-            skipped_songs=0,
-            concurrent_downloads=0,
-            error=None,
-            threads={},
-            metadata_progress=0,
-            metadata_completed=0,
-        )
-
-        base_path = os.path.join(os.getcwd(), os.getenv("DOWNLOAD_PATH", "songs"))
-        os.makedirs(base_path, exist_ok=True)
-
-        print("Phase 1: Downloading metadata and artwork...")
-        self.download_all_metadata_parallel(albums, base_path)
-
-        print("Phase 2: Preparing song downloads...")
-        self.update_progress(status="downloading")
-
-        download_queue = queue.Queue()
-
-        for album_idx, album in enumerate(albums):
-            album_name = self.sanitize_filename(album["name"])
-            artist_name = self.sanitize_filename(" & ".join(album["artists"]))
-            album_folder = f"{artist_name} - {album_name}"
-            album_path = os.path.join(base_path, album_folder)
-
-            for track_idx, track in enumerate(album["tracks"]):
-
-                track_details = album.get("metadata", {}).get("tracks_detailed", [])
-                duration_ms = None
-                if track_idx < len(track_details):
-                    duration_ms = track_details[track_idx].get("duration_ms")
-
-                song_info = {
-                    "name": track,
-                    "artists": album["artists"],
-                    "album_name": album_name,
-                    "artist_name": artist_name,
-                    "album_path": album_path,
-                    "album_idx": album_idx,
-                    "duration_ms": duration_ms,
-                }
-                download_queue.put(song_info)
-
-        print(f"Created download queue with {download_queue.qsize()} songs")
-        completed_albums_set = set()
-
-        def worker(thread_id):
-
+        def worker(tid):
             while True:
                 try:
-                    song_info = download_queue.get(timeout=5)
-                    current_album = (
-                        f"{song_info['album_name']} by {song_info['artist_name']}"
-                    )
-                    self.update_progress(current_album=current_album)
-                    result = self.download_song(
-                        song_info, song_info["album_path"], thread_id
-                    )
-                    download_queue.task_done()
-                    self.check_album_completion(
-                        albums, song_info["album_idx"], completed_albums_set
-                    )
-
-                except queue.Empty:
-                    print(f"Thread {thread_id}: No more songs, exiting")
-                    break
-                except Exception as e:
-                    print(f"Thread {thread_id}: Worker error: {e}")
-                    download_queue.task_done()
-
-        try:
-            max_workers = self._progress["max_concurrent"]
-            threads = []
-
-            for thread_id in range(max_workers):
-                thread = threading.Thread(target=worker, args=(thread_id,))
-                thread.daemon = True
-                thread.start()
-                threads.append(thread)
-                print(f"Started worker thread {thread_id}")
-
-            download_queue.join()
-
-            for thread in threads:
-                thread.join(timeout=10)
-
-            self.update_progress(
-                status="completed",
-                album_progress=100,
-                song_progress=100,
-                current_album="All downloads completed!",
-                current_song="",
-                concurrent_downloads=0,
-                completed_albums=len(albums),
-            )
-
-            print(
-                f"All downloads completed! Skipped {self._progress['skipped_songs']} existing songs."
-            )
-
-        except Exception as e:
-            print(f"Download error: {e}")
-            self.update_progress(status="error", error=str(e), concurrent_downloads=0)
-
-    def download_albums_cli(self, albums):
-
-        print(f"Initializing download of {len(albums)} albums...")
-        print(
-            f"Total songs to download: {sum(len(album['tracks']) for album in albums)}"
-        )
-        print()
-
-        base_path = os.path.join(os.getcwd(), os.getenv("DOWNLOAD_PATH", "songs"))
-        os.makedirs(base_path, exist_ok=True)
-
-        print("=" * 60)
-        print("Phase 1: Downloading metadata and artwork")
-        print("=" * 60)
-
-        metadata_start = time.time()
-
-        for idx, album in enumerate(albums):
-            album_name = self.sanitize_filename(album["name"])
-            artist_name = self.sanitize_filename(" & ".join(album["artists"]))
-            album_folder = f"{artist_name} - {album_name}"
-            album_path = os.path.join(base_path, album_folder)
-
-            os.makedirs(album_path, exist_ok=True)
-
-            print(
-                f"[{idx+1}/{len(albums)}] Processing: {album['name']} by {', '.join(album['artists'])}"
-            )
-            self.save_album_metadata(album, album_path)
-            self.download_album_artwork(album, album_path)
-
-        metadata_time = time.time() - metadata_start
-        print(f"\n✓ Metadata phase complete in {metadata_time:.1f}s")
-        print()
-
-        print("=" * 60)
-        print("Phase 2: Downloading songs")
-        print("=" * 60)
-
-        download_queue = queue.Queue()
-
-        for album_idx, album in enumerate(albums):
-            album_name = self.sanitize_filename(album["name"])
-            artist_name = self.sanitize_filename(" & ".join(album["artists"]))
-            album_folder = f"{artist_name} - {album_name}"
-            album_path = os.path.join(base_path, album_folder)
-
-            for song in album["tracks"]:
-                song_info = {
-                    "name": song,
-                    "artists": album["artists"],
-                    "album_name": album_name,
-                    "artist_name": artist_name,
-                    "album_path": album_path,
-                    "album_idx": album_idx,
-                }
-                download_queue.put(song_info)
-
-        total_songs = download_queue.qsize()
-        completed_songs = [0]
-        skipped_songs = [0]
-        failed_songs = [0]
-        completed_albums_set = set()
-        progress_lock = threading.Lock()
-
-        print(f"Songs in queue: {total_songs}")
-        print()
-
-        def worker(thread_id):
-
-            while True:
-                try:
-                    song_info = download_queue.get(timeout=5)
-
-                    song_name = self.sanitize_filename(song_info["name"])
-                    already_exists = self.check_song_exists(
-                        song_name, song_info["album_path"]
-                    )
-
-                    result = self.download_song(
-                        song_info, song_info["album_path"], thread_id
-                    )
-
-                    with progress_lock:
-                        if already_exists:
-                            skipped_songs[0] += 1
-                        elif result:
-                            completed_songs[0] += 1
-                        else:
-                            failed_songs[0] += 1
-
-                        total_done = (
-                            completed_songs[0] + skipped_songs[0] + failed_songs[0]
-                        )
-                        if total_done % 10 == 0 or total_done == total_songs:
-                            print(
-                                f"Progress: {total_done}/{total_songs} ({completed_songs[0]} new, {skipped_songs[0]} skipped, {failed_songs[0]} failed)"
-                            )
-
-                    download_queue.task_done()
-                    self.check_album_completion(
-                        albums, song_info["album_idx"], completed_albums_set
-                    )
-
+                    info = dq.get(timeout=5)
+                    result = self.download_song(info, info["album_path"], tid)
+                    on_result(info, result, self._song_exists(_sanitize(info["name"]), info["album_path"]))
+                    dq.task_done()
+                    self._check_album_complete(albums, info["album_idx"], completed_set)
                 except queue.Empty:
                     break
-                except Exception as e:
-                    print(f"Thread {thread_id}: Worker error: {e}")
-                    with progress_lock:
-                        failed_songs[0] += 1
-                    download_queue.task_done()
+                except Exception:
+                    dq.task_done()
 
-        download_start = time.time()
-        max_workers = self._progress["max_concurrent"]
-        threads = []
+        threads = [threading.Thread(target=worker, args=(tid,), daemon=True) for tid in range(self.max_concurrent)]
+        for t in threads:
+            t.start()
+        dq.join()
+        for t in threads:
+            t.join(timeout=10)
+        return completed_set
 
-        for thread_id in range(max_workers):
-            thread = threading.Thread(target=worker, args=(thread_id,))
-            thread.daemon = True
-            thread.start()
-            threads.append(thread)
-
-        download_queue.join()
-
-        for thread in threads:
-            thread.join(timeout=10)
-
-        download_time = time.time() - download_start
-
-        print()
-        print("=" * 60)
-        print("Download Complete!")
-        print("=" * 60)
-        print(f"Total albums: {len(albums)}")
-        print(f"Completed albums: {len(completed_albums_set)}")
-        print(f"Total songs: {total_songs}")
-        print(f"Downloaded: {completed_songs[0]}")
-        print(f"Skipped (existing): {skipped_songs[0]}")
-        print(f"Failed: {failed_songs[0]}")
-        print(f"Time taken: {download_time:.1f}s")
-        if total_songs > 0:
-            print(f"Average: {download_time/total_songs:.1f}s per song")
-        print("=" * 60)
-
-    def check_album_completion(self, albums, album_idx, completed_albums_set):
-
-        if album_idx in completed_albums_set:
+    def _check_album_complete(self, albums, idx, completed_set):
+        if idx in completed_set:
             return
-
-        album = albums[album_idx]
-        album_name = self.sanitize_filename(album["name"])
-        artist_name = self.sanitize_filename(" & ".join(album["artists"]))
-        album_folder = f"{artist_name} - {album_name}"
-        album_path = os.path.join(os.getcwd(), "songs", album_folder)
-
+        album = albums[idx]
+        path = self._album_folder(album, os.path.join(os.getcwd(), os.getenv("DOWNLOAD_PATH", "songs")))
         try:
-            files_in_album = os.listdir(album_path)
-            song_files = [
-                f
-                for f in files_in_album
-                if not f.startswith(".")
-                and "_thread" not in f
-                and f not in ["album.json", "album.png", "artist.png"]
-            ]
-
-            if len(song_files) >= len(album["tracks"]):
-                completed_albums_set.add(album_idx)
-                completed_count = len(completed_albums_set)
-                album_progress = (completed_count / len(albums)) * 100
-
-                self.update_progress(
-                    completed_albums=completed_count, album_progress=album_progress
-                )
-
-                print(
-                    f"Album completed: {album_name} ({completed_count}/{len(albums)})"
-                )
+            songs = [f for f in os.listdir(path) if not f.startswith(".") and "_thread" not in f and f not in ("album.json", "album.png", "artist.png")]
+            if len(songs) >= len(album["tracks"]):
+                completed_set.add(idx)
+                self._update(completed_albums=len(completed_set))
         except OSError:
             pass
 
-    def get_file_size(self, filepath):
+    def download_albums_cli(self, albums):
+        base_path = os.path.join(os.getcwd(), os.getenv("DOWNLOAD_PATH", "songs"))
+        os.makedirs(base_path, exist_ok=True)
 
+        # Phase 1: Metadata + artwork
+        console.print("\n[bold yellow]Phase 1: Downloading metadata and artwork[/bold yellow]")
+        p1_lock = threading.Lock()
+        p1_count = 0
+        with Progress(TextColumn("[progress.description]{task.description}"), BarColumn(), TaskProgressColumn(), console=console) as prog:
+            task = prog.add_task("Processing albums...", total=len(albums))
+
+            def _process_album(album):
+                nonlocal p1_count
+                apath = self._album_folder(album, base_path)
+                os.makedirs(apath, exist_ok=True)
+                self._save_album_metadata(album, apath)
+                self._download_artwork(album, apath)
+                with p1_lock:
+                    p1_count += 1
+                    prog.update(task, description=f"[{p1_count}/{len(albums)}] {album['name'][:40]}", advance=1)
+
+            with ThreadPoolExecutor(max_workers=min(10, len(albums))) as ex:
+                list(ex.map(_process_album, albums))
+        console.print("[green]✓[/green] Metadata complete")
+
+        # Phase 2: Artists
+        unique_artists = {a["id"]: a["name"] for album in albums for a in album.get("metadata", {}).get("artists_detailed", [])[:1] if a.get("id")}
+        console.print(f"\n[bold yellow]Phase 2: Artist data ({len(unique_artists)} artists)[/bold yellow]")
+        p2_lock = threading.Lock()
+        p2_count = 0
+        artist_items = list(unique_artists.items())
+        with Progress(TextColumn("[progress.description]{task.description}"), BarColumn(), TaskProgressColumn(), console=console) as prog:
+            task = prog.add_task("Fetching artists...", total=len(artist_items))
+
+            def _process_artist(item):
+                nonlocal p2_count
+                aid, aname = item
+                self.fetch_and_save_artist_data(aid, aname)
+                with p2_lock:
+                    p2_count += 1
+                    prog.update(task, description=f"[{p2_count}/{len(artist_items)}] {aname[:40]}", advance=1)
+
+            with ThreadPoolExecutor(max_workers=min(10, len(artist_items))) as ex:
+                list(ex.map(_process_artist, artist_items))
+        console.print("[green]✓[/green] Artist data complete")
+
+        # Phase 3: Songs
+        console.print("\n[bold yellow]Phase 3: Downloading songs[/bold yellow]")
+        total_songs = sum(len(a["tracks"]) for a in albums)
+        counts = {"done": 0, "skipped": 0, "failed": 0}
+        lock = threading.Lock()
+
+        self.tui.update_state(albums={"total": len(albums), "completed": 0}, songs={"total": total_songs, "completed": 0, "failed": 0, "skipped": 0})
+        self.tui.initialize()
+
+        def on_result(info, result, was_existing):
+            with lock:
+                if was_existing or (result and not was_existing and self._song_exists(_sanitize(info["name"]), info["album_path"])):
+                    pass  # already tracked by download_song via _update
+            self.tui.refresh()
+
+        dq = self._build_song_queue(albums, base_path)
+        t0 = time.time()
         try:
-            return os.path.getsize(filepath)
-        except:
-            return 0
+            completed_set = self._run_workers(dq, albums, on_result)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Cancelled.[/yellow]")
+        finally:
+            self.tui.shutdown()
 
-    def format_size(self, size_bytes):
-
-        for unit in ["B", "KB", "MB", "GB"]:
-            if size_bytes < 1024.0:
-                return f"{size_bytes:.2f} {unit}"
-            size_bytes /= 1024.0
-        return f"{size_bytes:.2f} TB"
-
-    def compress_audio_file(self, filepath):
-
-        temp_output = None
-        original_size = 0
-        compressed_size = 0
-        try:
-            original_size = self.get_file_size(filepath)
-
-            if original_size < 1 * 1024 * 1024:
-                print(
-                    f"Skipping {os.path.basename(filepath)} - already small ({self.format_size(original_size)})"
-                )
-                return False, original_size, original_size
-
-            filename, ext = os.path.splitext(filepath)
-            temp_output = f"{filename}_compressed.mp3"
-
-            original_size_mb = original_size / (1024 * 1024)
-
-            if self._max_file_size_mb and original_size_mb > self._max_file_size_mb:
-
-                if original_size_mb > self._max_file_size_mb * 2:
-                    bitrate = "96k"
-                    quality = "5"
-                    print(
-                        f"  Very large file ({self.format_size(original_size)}), using 96kbps (aggressive)"
-                    )
-                else:
-                    bitrate = "128k"
-                    quality = "4"
-                    print(
-                        f"  Large file ({self.format_size(original_size)}), using 128kbps"
-                    )
-
-            elif original_size > 8 * 1024 * 1024:
-                bitrate = "128k"
-                quality = "4"
-                print(
-                    f"  Large file detected ({self.format_size(original_size)}), using 128kbps"
-                )
-            else:
-
-                if ext.lower() == ".mp3":
-                    print(
-                        f"Skipping {os.path.basename(filepath)} - already MP3 and small"
-                    )
-                    return False, original_size, original_size
-                bitrate = "192k"
-                quality = "2"
-
-            cmd = [
-                "ffmpeg",
-                "-i",
-                filepath,
-                "-codec:a",
-                "libmp3lame",
-                "-b:a",
-                bitrate,
-                "-q:a",
-                quality,
-                "-map",
-                "a",
-                "-y",
-                "-loglevel",
-                "error",
-                temp_output,
-            ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-
-            if result.returncode != 0:
-                print(f"  FFmpeg error for {filepath}: {result.stderr}")
-                if os.path.exists(temp_output):
-                    os.remove(temp_output)
-                return False, original_size, original_size
-
-            compressed_size = self.get_file_size(temp_output)
-
-            min_savings = 0.01 if original_size > 4 * 1024 * 1024 else 0.05
-
-            if compressed_size < original_size * (1 - min_savings):
-
-                backup_path = f"{filename}_original{ext}"
-
-                os.replace(filepath, backup_path)
-                os.replace(temp_output, filepath)
-
-                try:
-                    os.remove(backup_path)
-                except:
-                    pass
-
-                space_saved = original_size - compressed_size
-                savings_percent = (space_saved / original_size) * 100
-                print(
-                    f"  ✓ Compressed: {self.format_size(original_size)} → {self.format_size(compressed_size)} (saved {self.format_size(space_saved)}, {savings_percent:.1f}%)"
-                )
-                return True, original_size, compressed_size
-            else:
-
-                if os.path.exists(temp_output):
-                    os.remove(temp_output)
-                print(
-                    f"  Skipping {os.path.basename(filepath)} - compression not beneficial"
-                )
-                return False, original_size, original_size
-
-        except subprocess.TimeoutExpired:
-            print(f"  Compression timeout for {filepath}")
-            if temp_output and os.path.exists(temp_output):
-                os.remove(temp_output)
-            return False, original_size, original_size
-        except Exception as e:
-            if temp_output and os.path.exists(temp_output):
-                print(f"  Error compressing {filepath}: {e}")
-                os.remove(temp_output)
-            return (
-                False,
-                original_size if "original_size" in locals() else 0,
-                original_size if "original_size" in locals() else 0,
-            )
+        elapsed = time.time() - t0
+        p = self._progress
+        console.print(Panel(Text("Download Complete!", style="bold green"), style="bold green"))
+        console.print(f"Downloaded: [green]{p['completed_songs'] - p['skipped_songs']}[/green] | Skipped: [yellow]{p['skipped_songs']}[/yellow] | Failed: [red]{p['failed_downloads']}[/red]")
+        console.print(f"Time: [cyan]{elapsed:.1f}s[/cyan]" + (f" | Avg: [cyan]{elapsed/total_songs:.1f}s/song[/cyan]" if total_songs else ""))
 
     def compress_all_music(self):
-
-        import subprocess
-
-        with self._progress_lock:
-            self._progress["compression"] = {
-                "status": "scanning",
-                "total_files": 0,
-                "completed_files": 0,
-                "current_file": "",
-                "progress": 0,
-                "space_saved": 0,
-                "original_size": 0,
-                "compressed_size": 0,
-            }
-
         base_path = os.path.join(os.getcwd(), os.getenv("DOWNLOAD_PATH", "songs"))
-
         if not os.path.exists(base_path):
-            with self._progress_lock:
-                self._progress["compression"]["status"] = "error"
-                self._progress["compression"][
-                    "current_file"
-                ] = "Songs directory not found"
-            print(f"Error: Songs directory not found at {base_path}")
+            console.print(f"[red]Songs directory not found: {base_path}[/red]")
             return
 
-        audio_extensions = [".mp3", ".m4a", ".webm", ".opus", ".ogg", ".wav", ".flac"]
-        audio_files = []
+        exts = {".mp3", ".m4a", ".webm", ".opus", ".ogg", ".wav", ".flac"}
+        files = [os.path.join(r, f) for r, _, fs in os.walk(base_path) for f in fs if os.path.splitext(f)[1].lower() in exts]
+        console.print(f"Found {len(files)} audio files\n")
 
-        print("Scanning for audio files...")
-        for root, dirs, files in os.walk(base_path):
-            for file in files:
-                if any(file.lower().endswith(ext) for ext in audio_extensions):
-                    audio_files.append(os.path.join(root, file))
+        total_orig = total_comp = 0
+        for i, fp in enumerate(files):
+            console.print(f"[{i+1}/{len(files)}] {os.path.basename(fp)}")
+            orig, comp = self._compress_file(fp)
+            total_orig += orig
+            total_comp += comp
 
-        total_files = len(audio_files)
-        print(f"Found {total_files} audio files to compress\n")
+        saved = total_orig - total_comp
+        console.print(f"\n[bold]Complete![/bold] {_fmt_bytes(total_orig)} → {_fmt_bytes(total_comp)} (saved {_fmt_bytes(saved)}, {saved/total_orig*100:.1f}%)" if total_orig else "\n[bold]Complete![/bold]")
 
-        with self._progress_lock:
-            self._progress["compression"]["total_files"] = total_files
-            self._progress["compression"]["status"] = "compressing"
+    def _compress_file(self, fp):
+        orig = os.path.getsize(fp) if os.path.exists(fp) else 0
+        if orig < 1 << 20:
+            console.print(f"  Skip (small): {_fmt_bytes(orig)}")
+            return orig, orig
 
-        if total_files == 0:
-            with self._progress_lock:
-                self._progress["compression"]["status"] = "completed"
-                self._progress["compression"]["current_file"] = "No audio files found"
-            print("No audio files found to compress")
-            return
+        ext = os.path.splitext(fp)[1].lower()
+        if self._max_file_size_mb and orig > self._max_file_size_mb * 2 * (1 << 20):
+            bitrate, q = "96k", "5"
+        elif orig > 8 << 20 or (self._max_file_size_mb and orig > self._max_file_size_mb * (1 << 20)):
+            bitrate, q = "128k", "4"
+        elif ext == ".mp3":
+            console.print("  Skip (already MP3 and small)")
+            return orig, orig
+        else:
+            bitrate, q = "192k", "2"
 
-        total_original_size = 0
-        total_compressed_size = 0
-        completed = 0
+        tmp = f"{os.path.splitext(fp)[0]}_compressed.mp3"
+        try:
+            r = subprocess.run(["ffmpeg", "-i", fp, "-codec:a", "libmp3lame", "-b:a", bitrate, "-q:a", q, "-map", "a", "-y", "-loglevel", "error", tmp], capture_output=True, text=True, timeout=300)
+            if r.returncode != 0 or not os.path.exists(tmp):
+                return orig, orig
 
-        for filepath in audio_files:
-            filename = os.path.basename(filepath)
+            comp = os.path.getsize(tmp)
+            min_savings = 0.01 if orig > 4 << 20 else 0.05
+            if comp < orig * (1 - min_savings):
+                os.replace(fp, f"{os.path.splitext(fp)[0]}_orig{ext}")
+                os.replace(tmp, fp)
+                try:
+                    os.remove(f"{os.path.splitext(fp)[0]}_orig{ext}")
+                except Exception:
+                    pass
+                saved = orig - comp
+                console.print(f"  ✓ {_fmt_bytes(orig)} → {_fmt_bytes(comp)} (saved {_fmt_bytes(saved)}, {saved/orig*100:.1f}%)")
+                return orig, comp
+            else:
+                os.remove(tmp)
+                console.print("  Skip (compression not beneficial)")
+                return orig, orig
+        except Exception as e:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            console.print(f"  Error: {e}")
+            return orig, orig
 
-            with self._progress_lock:
-                self._progress["compression"]["current_file"] = filename
-                self._progress["compression"]["completed_files"] = completed
-                self._progress["compression"]["progress"] = (
-                    completed / total_files
-                ) * 100
 
-            print(f"[{completed+1}/{total_files}] Processing: {filename}")
+# ─── CLI ──────────────────────────────────────────────────────────────────────
 
-            success, original_size, compressed_size = self.compress_audio_file(filepath)
-
-            total_original_size += original_size
-            total_compressed_size += compressed_size
-            completed += 1
-
-            with self._progress_lock:
-                self._progress["compression"]["original_size"] = total_original_size
-                self._progress["compression"]["compressed_size"] = total_compressed_size
-                self._progress["compression"]["space_saved"] = (
-                    total_original_size - total_compressed_size
-                )
-
-        with self._progress_lock:
-            self._progress["compression"]["status"] = "completed"
-            self._progress["compression"]["completed_files"] = total_files
-            self._progress["compression"]["progress"] = 100
-            self._progress["compression"]["current_file"] = "Compression complete!"
-
-        space_saved = total_original_size - total_compressed_size
-        print(f"\n{'='*60}")
-        print(f"Compression complete!")
-        print(f"{'='*60}")
-        print(f"Original size:    {self.format_size(total_original_size)}")
-        print(f"Compressed size:  {self.format_size(total_compressed_size)}")
-        print(
-            f"Space saved:      {self.format_size(space_saved)} ({(space_saved/total_original_size*100):.1f}%)"
-        )
-        print(f"{'='*60}")
-
+def _require_auth():
+    if not load_spotify_token():
+        console.print("[red]Not authenticated. Run with --auth first.[/red]")
+        return False
+    return True
 
 def main():
     parser = argparse.ArgumentParser(description="Spotify Album Downloader")
-    parser.add_argument(
-        "--compress",
-        action="store_true",
-        help="Compress all existing music files to save space",
-    )
-    parser.add_argument(
-        "--max-size",
-        type=int,
-        default=None,
-        help="Maximum file size in MB (files larger will be compressed more aggressively)",
-    )
-    parser.add_argument(
-        "--download",
-        action="store_true",
-        help="Download all liked albums (requires authentication first)",
-    )
-    parser.add_argument(
-        "--auth",
-        action="store_true",
-        help="Authenticate with Spotify (opens browser for OAuth)",
-    )
-    parser.add_argument(
-        "--fetch-albums",
-        action="store_true",
-        help="Fetch and save list of liked albums to liked_albums.json",
-    )
-    parser.add_argument(
-        "--threads",
-        type=int,
-        default=None,
-        help="Number of concurrent download threads (default: 4)",
-    )
-
+    parser.add_argument("--auth",          action="store_true", help="Authenticate with Spotify")
+    parser.add_argument("--download",      action="store_true", help="Download all liked albums")
+    parser.add_argument("--fetch-albums",  action="store_true", help="Save liked albums to liked_albums.json")
+    parser.add_argument("--fetch-artists", action="store_true", help="Fetch and save artist data")
+    parser.add_argument("--compress",      action="store_true", help="Compress all music files")
+    parser.add_argument("--max-size",      type=int,   default=None, help="Max file size MB for compression")
+    parser.add_argument("--threads",       type=int,   default=None, help="Concurrent download threads (default: 4)")
     args = parser.parse_args()
 
-    if args.compress:
-        print("Starting compression of all music files...")
-        if args.max_size:
-            print(f"Target maximum file size: {args.max_size}MB")
-        print("Compression settings:")
-        print("  - Files >8MB: 128kbps")
-        print("  - Files 4-8MB: 160kbps")
-        print("  - Files 2-4MB: 192kbps")
-        print("  - Files <2MB: 192kbps (skip if already MP3)")
-        print("Original files will be replaced after successful compression\n")
-
-        download_manager = DownloadManager()
-        if args.max_size:
-            download_manager._max_file_size_mb = args.max_size
-        download_manager.compress_all_music()
-
-        return
-
     if args.auth:
-        print("Starting Spotify authentication...")
-        print("=" * 60)
         authenticate_cli()
         return
 
+    if args.compress:
+        console.print(Panel(Text("Compression Mode", style="bold yellow"), style="bold"))
+        dm = DownloadManager()
+        if args.max_size:
+            dm._max_file_size_mb = args.max_size
+        dm.compress_all_music()
+        return
+
     if args.fetch_albums:
-        if not load_spotify_token():
-            print("Error: Not authenticated. Run with --auth first.")
+        if not _require_auth():
             return
-        print("Fetching liked albums from Spotify...")
         albums = get_liked_albums()
         with open("liked_albums.json", "w") as f:
             json.dump(albums, f, indent=2)
-        print(f"✓ Saved {len(albums)} albums to liked_albums.json")
+        console.print(f"[green]✓[/green] Saved {len(albums)} albums to liked_albums.json")
+        return
+
+    if args.fetch_artists:
+        if not _require_auth():
+            return
+        albums = get_liked_albums()
+        dm = DownloadManager()
+        unique = {a["id"]: a["name"] for album in albums for a in album.get("metadata", {}).get("artists_detailed", [])[:1] if a.get("id")}
+        console.print(f"Found {len(unique)} unique artists")
+        with Progress(TextColumn("[progress.description]{task.description}"), BarColumn(), TaskProgressColumn(), console=console) as prog:
+            task = prog.add_task("Fetching artists...", total=len(unique))
+            for i, (aid, aname) in enumerate(unique.items()):
+                prog.update(task, description=f"[{i+1}/{len(unique)}] {aname[:40]}")
+                dm.fetch_and_save_artist_data(aid, aname)
+                prog.advance(task)
+        console.print(f"[green]✓[/green] Saved {len(unique)} artists to artists/")
         return
 
     if args.download:
-        if not load_spotify_token():
-            print("Error: Not authenticated. Run with --auth first.")
+        if not _require_auth():
             return
-
-        print("Starting album download...")
-        print("=" * 60)
-
         albums = get_liked_albums()
-        print(f"Found {len(albums)} liked albums")
-        print(f"Total songs: {sum(len(album['tracks']) for album in albums)}")
-
-        download_manager = DownloadManager()
+        console.print(f"Found [cyan]{len(albums)}[/cyan] albums ({sum(len(a['tracks']) for a in albums)} songs)")
+        dm = DownloadManager()
         if args.threads:
-            download_manager._progress["max_concurrent"] = args.threads
-            print(f"Using {args.threads} concurrent download threads")
-
-        print("\nStarting downloads...\n")
-        download_manager.download_albums_cli(albums)
-
+            dm.max_concurrent = args.threads
+        dm.download_albums_cli(albums)
         return
 
-    print("Spotify Album Downloader")
-    print("=" * 60)
-    print("Usage: python3 main.py [options]")
-    print()
-    print("Options:")
-    print("  --compress      Compress all existing music files to save space")
-    print("  --max-size      Maximum file size in MB (files larger will be compressed more aggressively)")
-    print("  --download      Download all liked albums (requires authentication first)")
-    print("  --auth          Authenticate with Spotify (opens browser for OAuth)")
-    print("  --fetch-albums  Fetch and save list of liked albums to liked_albums.json")
-    print("  --threads       Number of concurrent download threads (default: 4)")
-    print()
-    print("Example: python3 main.py --download --threads 8")
-    print()
-    print("For more information, visit https://github.com/mistium/spotifiler")
+    console.print(Panel(Text("Spotify Album Downloader", style="bold cyan"), style="bold"))
+    console.print("\n[bold]Usage:[/bold] python3 main.py [options]\n")
+    console.print("[bold]Options:[/bold]")
+    for flag, desc in [
+        ("--auth",          "Authenticate with Spotify"),
+        ("--download",      "Download all liked albums"),
+        ("--fetch-albums",  "Save liked albums list to JSON"),
+        ("--fetch-artists", "Fetch artist data (bio, images, albums)"),
+        ("--compress",      "Compress all music files"),
+        ("--max-size N",    "Max file size MB (aggressive compression above this)"),
+        ("--threads N",     "Concurrent download threads (default: 4)"),
+    ]:
+        console.print(f"  {flag:<20} {desc}")
+    console.print("\n[cyan]Example:[/cyan] python3 main.py --download --threads 8\n")
+
 
 if __name__ == "__main__":
     main()
