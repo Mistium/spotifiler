@@ -1416,7 +1416,7 @@ def main():
     print()
     print("Example: python3 main.py --download --threads 8")
     print()
-    print("For more information, visit https://github.com/samuelngs/spotifydown")
+    print("For more information, visit https://github.com/mistium/spotifiler")
 
 if __name__ == "__main__":
     main()
