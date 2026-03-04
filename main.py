@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 import requests
 from datetime import timedelta
+import urllib.parse
 
 from rich.console import Console
 from rich.layout import Layout
@@ -309,6 +310,8 @@ def _parse_speed(s):
 
 
 def _sanitize(name):
+    if "/" in name:
+        name = name.replace("/", "__slash__")
     return name
 
 
@@ -644,7 +647,8 @@ class DownloadManager:
         return False, "Download failed"
 
     def download_song(self, song_info, album_path, tid=0):
-        name = _sanitize(song_info["name"])
+        name = song_info["name"]
+        file_name = name.replace("/", "__slash__")
         artist = _sanitize(" & ".join(song_info["artists"]))
         album_name = song_info.get("album_name", "")
         duration_ms = song_info.get("duration_ms")
@@ -653,7 +657,7 @@ class DownloadManager:
             tid, current_song=f"{name} by {artist}", status="checking", progress=0
         )
 
-        if self._song_exists(name, album_path):
+        if self._song_exists(file_name, album_path):
             self._update_thread(tid, status="skipped", progress=100)
             self._update(
                 completed_songs=self._progress["completed_songs"] + 1,
@@ -669,7 +673,8 @@ class DownloadManager:
             return False
 
         self._update_thread(tid, status="downloading")
-        temp = f"{name}_thread{tid}_{int(time.time())}"
+
+        temp = f"{file_name}_thread{tid}_{int(time.time())}"
         opts = {
             "outtmpl": os.path.join(album_path, f"{temp}.%(ext)s"),
             "quiet": True,
@@ -691,9 +696,11 @@ class DownloadManager:
             self._update(failed_downloads=self._progress["failed_downloads"] + 1)
             return False
 
-        temp_path = os.path.join(album_path, result)
-        ext = os.path.splitext(result)[1].lower()
-        final_path = os.path.join(album_path, f"{name}.mp3")
+        result_cleaned = result.replace("/", "__slash__")
+
+        temp_path = os.path.join(album_path, result_cleaned)
+        ext = os.path.splitext(result_cleaned)[1].lower()
+        final_path = os.path.join(album_path, f"{file_name}.mp3")
 
         if ext != ".mp3":
             try:
@@ -720,7 +727,7 @@ class DownloadManager:
                 except Exception:
                     pass
             except Exception:
-                os.rename(temp_path, os.path.join(album_path, f"{name}{ext}"))
+                os.rename(temp_path, os.path.join(album_path, f"{file_name}{ext}"))
         else:
             os.rename(temp_path, final_path)
 
