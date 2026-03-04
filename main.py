@@ -309,7 +309,7 @@ def _parse_speed(s):
 
 
 def _sanitize(name):
-    return re.sub(r'[<>:"/\\|?*]', "", name).strip()[:200]
+    return name
 
 
 # ─── Spotify ──────────────────────────────────────────────────────────────────
@@ -714,7 +714,6 @@ class DownloadManager:
                         final_path,
                     ],
                     capture_output=True,
-                    timeout=120,
                 )
                 try:
                     os.remove(temp_path)
@@ -1279,6 +1278,12 @@ def main():
         default=None,
         help="Concurrent download threads (default: 4)",
     )
+    parser.add_argument(
+        "--replace-song",
+        nargs=2,
+        metavar=("SONG_NAME", "YOUTUBE_URL"),
+        help="Replace a song by name using YouTube URL",
+    )
     args = parser.parse_args()
 
     if args.auth:
@@ -1293,6 +1298,77 @@ def main():
         if args.max_size:
             dm._max_file_size_mb = args.max_size
         dm.compress_all_music()
+        return
+
+    if args.replace_song:
+        song_name, youtube_url = args.replace_song
+        console.print(f"\n[bold yellow]Replacing song: {song_name}[/bold yellow]")
+        console.print(f"[cyan]YouTube URL:[/cyan] {youtube_url}\n")
+
+        base_path = os.path.join(os.getcwd(), os.getenv("DOWNLOAD_PATH", "songs"))
+        os.makedirs(base_path, exist_ok=True)
+
+        # Remove existing file if present
+        existing_file = os.path.join(base_path, f"{song_name}.mp3")
+        if os.path.exists(existing_file):
+            os.remove(existing_file)
+            console.print(f"[yellow]Removed existing file: {song_name}.mp3[/yellow]")
+
+        # Download directly from the provided YouTube URL
+        album_path = os.path.join(base_path, song_name.split("/")[0])
+        only_song_name = "/".join(song_name.split("/")[1:])
+        temp = f"{only_song_name}_{int(time.time())}"
+        opts = {
+            "outtmpl": os.path.join(album_path, f"{temp}.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+            "socket_timeout": 60,
+            "retries": 5,
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([youtube_url])
+
+            # Find the downloaded file
+            found = [f for f in os.listdir(album_path) if f.startswith(temp)]
+            if found:
+                temp_path = os.path.join(album_path, found[0])
+                ext = os.path.splitext(found[0])[1].lower()
+                final_path = os.path.join(album_path, f"{only_song_name}.mp3")
+
+                if ext != ".mp3":
+                    subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-i",
+                            temp_path,
+                            "-codec:a",
+                            "libmp3lame",
+                            "-b:a",
+                            "320k",
+                            "-map",
+                            "a",
+                            "-loglevel",
+                            "error",
+                            final_path,
+                        ],
+                        capture_output=True,
+                        timeout=120,
+                    )
+                    os.remove(temp_path)
+                else:
+                    os.rename(temp_path, final_path)
+
+                console.print(
+                    f"\n[green]✓[/green] Song downloaded successfully: {song_name}.mp3"
+                )
+            else:
+                console.print(f"\n[red]✗[/red] Download failed - no file found")
+        except Exception as e:
+            console.print(f"\n[red]✗[/red] Failed to download: {e}")
         return
 
     if args.fetch_albums:
@@ -1426,10 +1502,11 @@ def main():
         ("--fetch-albums", "Save liked albums list to JSON"),
         ("--fetch-artists", "Fetch artist data (bio, images, albums)"),
         ("--compress", "Compress all music files"),
+        ("--replace-song SONG YOUTUBE_URL", "Replace a song by name using YouTube URL"),
         ("--max-size N", "Max file size MB (aggressive compression above this)"),
         ("--threads N", "Concurrent download threads (default: 4)"),
     ]:
-        console.print(f"  {flag:<20} {desc}")
+        console.print(f"  {flag:<30} {desc}")
     console.print("\n[cyan]Example:[/cyan] python3 main.py --download --threads 8\n")
 
 
