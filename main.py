@@ -5,6 +5,7 @@ import re
 import subprocess
 import argparse
 import threading
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 import requests
@@ -66,6 +67,8 @@ class TUIManager:
         self.spin_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         self.spin_index = 0
         self.live = None
+        self.refresh_thread = None
+        self.should_stop_refresh = False
         self.state = {
             "albums": {"total": 0, "completed": 0},
             "songs": {"total": 0, "completed": 0, "failed": 0, "skipped": 0},
@@ -74,6 +77,8 @@ class TUIManager:
             "total_downloaded_bytes": 0,
             "download_speed": 0,
             "activity": "idle",
+            "global_eta": None,
+            "songs_per_second": 0,
         }
 
         self.layout = Layout()
@@ -94,8 +99,25 @@ class TUIManager:
         self.state["start_time"] = time.time()
         self.live = Live(self.layout, console=self.console, refresh_per_second=30)
         self.live.start()
+        self.should_stop_refresh = False
+        self.refresh_thread = threading.Thread(
+            target=self._periodic_refresh, daemon=True
+        )
+        self.refresh_thread.start()
+
+    def _periodic_refresh(self):
+        while not self.should_stop_refresh and self.live:
+            try:
+                time.sleep(1)
+                if not self.should_stop_refresh and self.live:
+                    self.refresh()
+            except Exception:
+                break
 
     def shutdown(self):
+        self.should_stop_refresh = True
+        if self.refresh_thread:
+            self.refresh_thread.join(timeout=2)
         if self.live:
             self.live.stop()
             self.live = None
@@ -170,6 +192,18 @@ class TUIManager:
             (" | ", "dim"),
             ("Speed: ", "dim"),
             (f"{_fmt_bytes(s['download_speed'])}/s", "cyan"),
+            (" | ", "dim"),
+            ("Speed: ", "dim"),
+            (f"{s.get('songs_per_second', 0):.1f}", "cyan"),
+            (" songs/s", "dim"),
+            (" | ", "dim"),
+            ("ETA: ", "dim"),
+            (
+                str(timedelta(seconds=s.get("global_eta", 0)))
+                if s.get("global_eta")
+                else "-:--:--",
+                "green",
+            ),
         )
         self.layout["footer"].update(Panel(Align.center(footer_text)))
 
@@ -200,8 +234,15 @@ class TUIManager:
             ("", ""),
             ("Data:", _fmt_bytes(s["total_downloaded_bytes"])),
             ("Speed:", f"{_fmt_bytes(s['download_speed'])}/s"),
+            ("Song Speed:", f"{s.get('songs_per_second', 0):.1f}/s"),
             ("", ""),
             ("Active:", f"[yellow]{active}[/yellow] threads"),
+            (
+                "ETA:",
+                str(timedelta(seconds=s.get("global_eta", 0)))
+                if s.get("global_eta")
+                else "-:--:--",
+            ),
         ]:
             st.add_row(*row)
         self.layout["stats"].update(
@@ -458,8 +499,21 @@ class DownloadManager:
         self._ready = True
         self._lock = threading.Lock()
         self.tui = TUIManager()
-        self.max_concurrent = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", 4))
+        self.max_concurrent = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", 16))
         self._max_file_size_mb = None
+        self.session = requests.Session()
+        self.session.mount(
+            "http://",
+            requests.adapters.HTTPAdapter(
+                pool_connections=64, pool_maxsize=64, max_retries=3
+            ),
+        )
+        self.session.mount(
+            "https://",
+            requests.adapters.HTTPAdapter(
+                pool_connections=64, pool_maxsize=64, max_retries=3
+            ),
+        )
         self._progress = {
             "total_albums": 0,
             "completed_albums": 0,
@@ -487,6 +541,40 @@ class DownloadManager:
                 if k in mapping:
                     section, field = mapping[k]
                     updates.setdefault(section, {})[field] = v
+
+            if "completed_songs" in kw:
+                elapsed = time.time() - self.tui.state.get("start_time", time.time())
+                if elapsed > 0:
+                    completed = self._progress.get("completed_songs", 0)
+                    skipped = self._progress.get("skipped_songs", 0)
+                    failed = self._progress.get("failed_downloads", 0)
+
+                    actual_downloaded = completed - skipped
+                    total_songs = self.tui.state.get("songs", {}).get("total", 0)
+                    remaining_downloads = total_songs - completed - failed
+
+                    if actual_downloaded > 0 and remaining_downloads > 0:
+                        avg_time_per_song = elapsed / actual_downloaded
+                        global_eta = int(avg_time_per_song * remaining_downloads)
+                    else:
+                        global_eta = None
+
+                    songs_per_sec = actual_downloaded / elapsed
+                    self.tui.update_state(
+                        songs_per_second=songs_per_sec, global_eta=global_eta
+                    )
+
+                    if completed > 0 and remaining_downloads > 0:
+                        avg_time_per_song = elapsed / completed
+                        global_eta = int(avg_time_per_song * remaining_downloads)
+                    else:
+                        global_eta = None
+
+                    songs_per_sec = completed / elapsed
+                    self.tui.update_state(
+                        songs_per_second=songs_per_sec, global_eta=global_eta
+                    )
+
             for section, vals in updates.items():
                 self.tui.update_state(**{section: vals})
             if updates:
@@ -567,15 +655,16 @@ class DownloadManager:
         def try_query(query):
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    results = ydl.extract_info(f"ytsearch3:{query}", download=False)
+                    results = ydl.extract_info(f"ytsearch5:{query}", download=False)
                 return (results or {}).get("entries") or []
             except Exception:
                 return []
 
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=8) as executor:
             all_entries = []
-            for entries in executor.map(try_query, queries):
-                all_entries.extend(entries)
+            futures = [executor.submit(try_query, q) for q in queries]
+            for future in as_completed(futures):
+                all_entries.extend(future.result())
 
         seen, unique_entries = set(), []
         for e in all_entries:
@@ -618,18 +707,20 @@ class DownloadManager:
             return False
 
     def _download_with_retry(
-        self, url, opts_base, album_path, temp_name, tid, retries=4
+        self, url, opts_base, album_path, temp_name, tid, retries=8
     ):
         formats = [
-            "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio/best",
+            "ba[ext=m4a]/ba[ext=webm]/ba[ext=opus]/ba/bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio/best",
             "bestaudio/best",
             "worstaudio/worst",
+            "best",
         ]
         for attempt in range(retries):
             for fmt in formats:
                 try:
                     if attempt:
-                        time.sleep(2**attempt)
+                        wait_time = min(2**attempt + random.uniform(1, 5), 10)
+                        time.sleep(wait_time)
                     opts = {**opts_base, "format": fmt}
                     with yt_dlp.YoutubeDL(opts) as ydl:
                         ydl.download([url])
@@ -641,9 +732,12 @@ class DownloadManager:
                 except Exception as e:
                     err = str(e).lower()
                     if "403" in err or "forbidden" in err:
-                        time.sleep(3 + attempt * 2)
+                        wait_time = min(3 + attempt * 3, 15)
+                        time.sleep(wait_time)
                     elif "format" not in err and "not available" not in err:
                         break
+                except SystemExit:
+                    pass
         return False, "Download failed"
 
     def download_song(self, song_info, album_path, tid=0):
@@ -737,10 +831,17 @@ class DownloadManager:
 
     def _download_image(self, url, path):
         try:
-            r = requests.get(url, stream=True, timeout=30)
+            r = self.session.get(
+                url,
+                stream=True,
+                timeout=30,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                },
+            )
             r.raise_for_status()
             with open(path, "wb") as f:
-                for chunk in r.iter_content(8192):
+                for chunk in r.iter_content(16384):
                     f.write(chunk)
             return True
         except Exception:
@@ -995,7 +1096,7 @@ class DownloadManager:
             t.start()
         dq.join()
         for t in threads:
-            t.join(timeout=10)
+            t.join(timeout=15)
         return completed_set
 
     def _check_album_complete(self, albums, idx, completed_set):
@@ -1052,7 +1153,7 @@ class DownloadManager:
                         advance=1,
                     )
 
-            with ThreadPoolExecutor(max_workers=min(10, len(albums))) as ex:
+            with ThreadPoolExecutor(max_workers=min(16, len(albums))) as ex:
                 list(ex.map(_process_album, albums))
         console.print("[green]✓[/green] Metadata complete")
 
@@ -1095,7 +1196,7 @@ class DownloadManager:
                             advance=1,
                         )
 
-                with ThreadPoolExecutor(max_workers=min(10, len(artist_items))) as ex:
+                with ThreadPoolExecutor(max_workers=min(16, len(artist_items))) as ex:
                     list(ex.map(_process_artist, artist_items))
         else:
             console.print("[yellow]All artist data already exists - skipping[/yellow]")
@@ -1323,15 +1424,32 @@ def main():
 
         # Download directly from the provided YouTube URL
         album_path = os.path.join(base_path, song_name.split("/")[0])
+        os.makedirs(album_path, exist_ok=True)
         only_song_name = "/".join(song_name.split("/")[1:])
         temp = f"{only_song_name}_{int(time.time())}"
         opts = {
             "outtmpl": os.path.join(album_path, f"{temp}.%(ext)s"),
             "quiet": True,
             "no_warnings": True,
-            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+            "format": "ba[ext=m4a]/ba[ext=webm]/ba[ext=opus]/ba/bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio/best",
             "socket_timeout": 60,
-            "retries": 5,
+            "retries": 10,
+            "fragment_retries": 10,
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "DNT": "1",
+                "Connection": "keep-alive",
+            },
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["ios", "android", "web"],
+                    "player_skip": ["configs", "jsd"],
+                }
+            },
+            "legacy_server_connect": True,
         }
 
         try:
